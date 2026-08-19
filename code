@@ -1,0 +1,202 @@
+/*
+  Landslide Early Warning Inclinometer — ESP8266 + HW-290 (GY-87) + passive buzzer
+
+  Connections (NodeMCU / Wemos D1 mini):
+    HW-290 VCC -> 3V3       IMPORTANT: use 3.3 V I2C logic with ESP8266
+    HW-290 GND -> GND
+    HW-290 SDA -> D2 / GPIO4
+    HW-290 SCL -> D1 / GPIO5
+    Low-level-trigger passive buzzer module VCC -> 3V3
+    Low-level-trigger passive buzzer module GND -> GND
+    Low-level-trigger passive buzzer module I/O -> D5 / GPIO14
+
+  The ESP creates its own Wi-Fi hotspot at static IP 192.168.4.1.
+  Connect to it and open http://192.168.4.1
+
+  Arduino Library Manager dependencies:
+    - Adafruit MPU6050
+    - Adafruit HMC5883 Unified
+    - Adafruit BMP085 Unified
+    - Adafruit Unified Sensor
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_HMC5883_U.h>
+#include <Adafruit_BMP085_U.h>
+
+// ----- User settings -----
+const char *AP_SSID = "Landslide-Warning";
+const char *AP_PASSWORD = "12345678"; // Minimum 8 characters
+const float TILT_WARNING_DEG = 8.0;       // Change to suit the site after field testing
+const float TILT_DANGER_DEG = 15.0;
+const uint32_t SAMPLE_INTERVAL_MS = 250;
+const uint32_t CALIBRATION_MS = 15000;    // Keep unit still after power-on
+
+const uint8_t SDA_PIN = D2;
+const uint8_t SCL_PIN = D1;
+const uint8_t BUZZER_PIN = D5;
+
+// Static address of ESP8266's own hotspot
+const IPAddress AP_IP(192, 168, 4, 1);
+const IPAddress AP_GATEWAY(192, 168, 4, 1);
+const IPAddress AP_SUBNET(255, 255, 255, 0);
+
+ESP8266WebServer server(80);
+Adafruit_MPU6050 mpu;
+Adafruit_HMC5883_Unified mag(12345);
+Adafruit_BMP085_Unified bmp(18085);
+
+bool mpuReady = false, magReady = false, bmpReady = false;
+bool calibrated = false;
+bool alarmActive = false;
+float pitch = NAN, roll = NAN, heading = NAN, pressure = NAN, temperature = NAN;
+float basePitch = 0, baseRoll = 0, relativeTilt = NAN;
+float pitchSum = 0, rollSum = 0;
+uint16_t calibrationSamples = 0;
+uint32_t calibrationStarted = 0, lastSampleAt = 0;
+
+String levelText() {
+  if (!mpuReady || !calibrated || isnan(relativeTilt)) return "CALIBRATING";
+  if (relativeTilt >= TILT_DANGER_DEG) return "DANGER";
+  if (relativeTilt >= TILT_WARNING_DEG) return "WARNING";
+  return "NORMAL";
+}
+
+// This module is LOW-level-triggered: hold I/O HIGH when it is inactive.
+// A passive buzzer needs a frequency signal, therefore tone() is used while alarming.
+void stopBuzzer() {
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void updateBuzzer() {
+  // Non-blocking pattern: WARNING = intermittent; DANGER = faster urgent pattern.
+  if (!alarmActive) { stopBuzzer(); return; }
+  uint32_t phase = millis() % (relativeTilt >= TILT_DANGER_DEG ? 400 : 1000);
+  bool on = relativeTilt >= TILT_DANGER_DEG ? phase < 250 : phase < 180;
+  if (on) tone(BUZZER_PIN, relativeTilt >= TILT_DANGER_DEG ? 2600 : 1800);
+  else stopBuzzer();
+}
+
+void sampleSensors() {
+  if (millis() - lastSampleAt < SAMPLE_INTERVAL_MS) return;
+  lastSampleAt = millis();
+
+  if (mpuReady) {
+    sensors_event_t a, g, t;
+    mpu.getEvent(&a, &g, &t);
+
+    // Angles derived from gravity vector; suitable when the unit is stationary/slow-moving.
+    pitch = atan2(a.acceleration.y, sqrt(sq(a.acceleration.x) + sq(a.acceleration.z))) * 180.0 / PI;
+    roll  = atan2(-a.acceleration.x, a.acceleration.z) * 180.0 / PI;
+
+    if (!calibrated) {
+      pitchSum += pitch;
+      rollSum += roll;
+      calibrationSamples++;
+      if (millis() - calibrationStarted >= CALIBRATION_MS && calibrationSamples > 0) {
+        basePitch = pitchSum / calibrationSamples;
+        baseRoll = rollSum / calibrationSamples;
+        calibrated = true;
+      }
+    }
+
+    if (calibrated) {
+      float dPitch = pitch - basePitch;
+      float dRoll = roll - baseRoll;
+      relativeTilt = sqrt(sq(dPitch) + sq(dRoll));
+      alarmActive = relativeTilt >= TILT_WARNING_DEG;
+    }
+  }
+
+  if (magReady) {
+    sensors_event_t e;
+    mag.getEvent(&e);
+    heading = atan2(e.magnetic.y, e.magnetic.x) * 180.0 / PI;
+    if (heading < 0) heading += 360;
+  }
+
+  if (bmpReady) {
+    sensors_event_t e;
+    bmp.getEvent(&e);
+    temperature = e.temperature;
+    bmp.getPressure(&pressure);
+  }
+}
+
+String jsonNumber(float value, uint8_t decimals = 1) {
+  return isnan(value) ? "null" : String(value, decimals);
+}
+
+void handleApiStatus() {
+  String json = "{";
+  json += "\"level\":\"" + levelText() + "\",";
+  json += "\"calibrated\":" + String(calibrated ? "true" : "false") + ",";
+  json += "\"calibrationRemaining\":" + String(calibrated ? 0 : max(0L, (long)(CALIBRATION_MS - (millis() - calibrationStarted)) / 1000)) + ",";
+  json += "\"pitch\":" + jsonNumber(pitch) + ",\"roll\":" + jsonNumber(roll) + ",";
+  json += "\"tilt\":" + jsonNumber(relativeTilt) + ",\"heading\":" + jsonNumber(heading) + ",";
+  json += "\"temperature\":" + jsonNumber(temperature) + ",\"pressure\":" + jsonNumber(pressure, 0) + ",";
+  json += "\"mpu\":" + String(mpuReady ? "true" : "false") + ",";
+  json += "\"mag\":" + String(magReady ? "true" : "false") + ",";
+  json += "\"bmp\":" + String(bmpReady ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleRecalibrate() {
+  calibrated = false;
+  alarmActive = false;
+  pitchSum = rollSum = 0;
+  calibrationSamples = 0;
+  calibrationStarted = millis();
+  stopBuzzer();
+  server.send(200, "application/json", "{\"ok\":true,\"message\":\"Calibration restarted. Keep the sensor still for 15 seconds.\"}");
+}
+
+void handleRoot() {
+  static const char page[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Landslide Warning</title><style>
+body{font-family:system-ui,sans-serif;margin:0;background:#f1f5f9;color:#172033}.wrap{max-width:720px;margin:auto;padding:20px}.card{background:#fff;border-radius:14px;padding:18px;margin:12px 0;box-shadow:0 2px 12px #0001}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.item{background:#f8fafc;padding:14px;border-radius:10px}.v{font-size:1.5rem;font-weight:700}.normal{color:#15803d}.warning{color:#b45309}.danger{color:#b91c1c}button{padding:12px 16px;border:0;border-radius:8px;background:#1d4ed8;color:#fff;font-weight:600}small{color:#64748b}</style></head>
+<body><main class="wrap"><h1>Landslide Early Warning</h1><section class="card"><div>Status: <strong id="level">Loading…</strong></div><small id="cal"></small></section>
+<section class="card grid"><div class="item">Relative tilt<div class="v"><span id="tilt">--</span>°</div></div><div class="item">Heading<div class="v"><span id="heading">--</span>°</div></div><div class="item">Pitch<div class="v"><span id="pitch">--</span>°</div></div><div class="item">Roll<div class="v"><span id="roll">--</span>°</div></div><div class="item">Temperature<div class="v"><span id="temp">--</span> °C</div></div><div class="item">Pressure<div class="v"><span id="pressure">--</span> Pa</div></div></section>
+<section class="card"><button onclick="fetch('/recalibrate',{method:'POST'})">Recalibrate baseline</button><p><small>Warning: 8°, Danger: 15°. Calibrate only when the sensor is in its correct stable position.</small></p><small id="sensors"></small></section></main>
+<script>const put=(id,x)=>document.getElementById(id).textContent=(x??'--');async function tick(){try{let d=await (await fetch('/api/status')).json();let l=document.getElementById('level');l.textContent=d.level;l.className=d.level.toLowerCase();put('tilt',d.tilt);put('heading',d.heading);put('pitch',d.pitch);put('roll',d.roll);put('temp',d.temperature);put('pressure',d.pressure);put('cal',d.calibrated?'Baseline calibrated':'Calibrating — keep sensor still ('+d.calibrationRemaining+' s)');put('sensors','Sensors: MPU6050 '+(d.mpu?'OK':'NOT FOUND')+' | HMC5883L '+(d.mag?'OK':'NOT FOUND')+' | BMP180 '+(d.bmp?'OK':'NOT FOUND'));}catch(e){put('cal','Connection lost');}}tick();setInterval(tick,1000);</script></body></html>)HTML";
+  server.send_P(200, "text/html", page);
+}
+
+void setup() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, HIGH); // LOW triggers this particular buzzer module
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  mpuReady = mpu.begin(0x68);
+  if (mpuReady) {
+    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+  magReady = mag.begin();
+  bmpReady = bmp.begin();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.println();
+  Serial.print("Hotspot IP: http://"); Serial.println(WiFi.softAPIP());
+
+  calibrationStarted = millis();
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/recalibrate", HTTP_POST, handleRecalibrate);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  sampleSensors();
+  updateBuzzer();
+}
